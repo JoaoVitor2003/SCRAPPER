@@ -15,6 +15,7 @@ import subprocess
 import threading
 import time
 import zipfile
+import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -27,15 +28,49 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-BASE         = Path("/home/PeaseErnest/scraper")
+IS_WINDOWS = sys.platform == "win32"
+SCRIPT_PATH = Path(__file__).resolve()
+
+def find_checkout_root(start):
+    for candidate in (start, *start.parents):
+        if (candidate / "c_core" / "native_host").exists():
+            return candidate
+    return None
+
+BASE = find_checkout_root(SCRIPT_PATH.parent)
+if BASE is None:
+    BASE = Path("/home/PeaseErnest/scraper")
+
+if IS_WINDOWS:
+    C_SOCKET = r"\\.\pipe\scraper"
+    RUST_BIN = BASE / "rust_finder" / "rust_finder.exe"
+    if not RUST_BIN.exists():
+        RUST_BIN = BASE / "rust_finder" / "target" / "x86_64-pc-windows-gnu" / "release" / "rust_finder.exe"
+else:
+    C_SOCKET = "/tmp/scraper.sock"
+    RUST_BIN = BASE / "rust_finder" / "target" / "release" / "rust_finder"
+
 DATA_DIR     = BASE / "data"
 LOGS_DIR     = BASE / "logs"
-RUST_BIN     = BASE / "rust_finder" / "target" / "release" / "rust_finder"
-C_SOCKET     = "/tmp/scraper.sock"
 API_PORT     = 8080
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+# The native host can write captures beside its executable while the API is run
+# from the checkout root. Watch both locations so exports include live data.
+DATA_DIRS = []
+for candidate in (
+    DATA_DIR,
+    BASE / "c_core" / "native_host" / "data",
+    BASE / "windows" / "c_core" / "native_host" / "data",
+    Path(os.environ.get("USERPROFILE", "C:/")) / ".scrapper" / "bin" / "data",
+):
+    if candidate not in DATA_DIRS:
+        DATA_DIRS.append(candidate)
+
+def existing_data_dirs():
+    return [d for d in DATA_DIRS if d.exists()]
 
 # ── In-memory store ───────────────────────────────────────────────────────────
 
@@ -51,6 +86,7 @@ store = {
     "dommaps":       defaultdict(list),
     "storage":       defaultdict(list),
     "fingerprints":  defaultdict(list),
+    "events":        defaultdict(list),
 }
 store_lock = threading.Lock()
 
@@ -122,28 +158,130 @@ FILE_TO_KEY = {
     "dommaps.jsonl":        "dommaps",
     "storage.jsonl":        "storage",
     "fingerprints.jsonl":   "fingerprints",
+    "events.jsonl":         "events",
 }
+
+EVENT_TYPE_TO_KEY = {
+    "request":             "requests",
+    "response":            "responses",
+    "response_body":       "bodies",
+    "auth_cookie":         "auth",
+    "cookies":             "cookies",
+    "cookies_changed":     "cookies",
+    "cookie_change":       "cookies",
+    "websocket":           "ws_frames",
+    "websocket_opened":    "ws_connections",
+    "websocket_handshake": "ws_connections",
+    "websocket_error":     "ws_connections",
+    "websocket_closed":    "ws_connections",
+    "dommap":              "dommaps",
+    "storage":             "storage",
+    "localStorage":        "storage",
+    "fingerprint":         "fingerprints",
+    "task_tokens":         "events",
+    "tokens":              "events",
+    "nav_started":         "events",
+    "debugger_status":     "events",
+    "ws_list":             "events",
+    "ws_frames_dump":      "events",
+}
+
+TYPE_TO_FILE = {
+    "request":             "requests.jsonl",
+    "response":            "responses.jsonl",
+    "response_body":       "bodies.jsonl",
+    "auth_cookie":         "auth.jsonl",
+    "cookies":             "cookies.jsonl",
+    "cookies_changed":     "cookies.jsonl",
+    "cookie_change":       "cookies.jsonl",
+    "websocket":           "ws_frames.jsonl",
+    "websocket_opened":    "ws_connections.jsonl",
+    "websocket_handshake": "ws_connections.jsonl",
+    "websocket_error":     "ws_connections.jsonl",
+    "websocket_closed":    "ws_connections.jsonl",
+    "dommap":              "dommaps.jsonl",
+    "storage":             "storage.jsonl",
+    "localStorage":        "storage.jsonl",
+    "fingerprint":         "fingerprints.jsonl",
+    "task_tokens":         "events.jsonl",
+    "tokens":              "events.jsonl",
+    "nav_started":         "events.jsonl",
+    "debugger_status":     "events.jsonl",
+    "ws_list":             "events.jsonl",
+    "ws_frames_dump":      "events.jsonl",
+}
+
+seen_events = set()
+
+def event_marker(key, obj):
+    return (
+        key,
+        obj.get("requestId"),
+        obj.get("timestamp"),
+        obj.get("url"),
+        obj.get("type"),
+        obj.get("name"),
+    )
+
+def remember_event(obj, key, add_to_live=True):
+    marker = event_marker(key, obj)
+    with store_lock:
+        if marker in seen_events:
+            return False
+        seen_events.add(marker)
+        domain = obj.get("domain", "unknown")
+        store[key][domain].append(obj)
+    if add_to_live:
+        with live_feed_lock:
+            live_feed.append(obj)
+            if len(live_feed) > MAX_LIVE:
+                live_feed.pop(0)
+    return True
+
+def persist_ingested_event(obj):
+    event_type = obj.get("type")
+    if event_type == "html":
+        path = DATA_DIR / f"html_{int(time.time())}.json"
+    elif event_type == "screenshot":
+        path = DATA_DIR / f"screenshot_{int(time.time())}.json"
+    else:
+        fname = TYPE_TO_FILE.get(event_type, "events.jsonl")
+        path = DATA_DIR / fname
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    return path
 
 # ── Load existing data ────────────────────────────────────────────────────────
 
 def load_existing():
-    for fname, key in FILE_TO_KEY.items():
-        path = DATA_DIR / fname
-        if not path.exists():
-            continue
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj    = json.loads(line)
-                    domain = obj.get("domain", "unknown")
-                    with store_lock:
-                        store[key][domain].append(obj)
-                except Exception:
-                    pass
-    print(f"[API] Loaded existing data from {DATA_DIR}")
+    loaded_dirs = existing_data_dirs()
+    seen = set()
+    for data_dir in loaded_dirs:
+        for fname, key in FILE_TO_KEY.items():
+            path = data_dir / fname
+            if not path.exists():
+                continue
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            marker = event_marker(key, obj)
+                            if marker in seen:
+                                continue
+                            seen.add(marker)
+                            seen_events.add(marker)
+                            domain = obj.get("domain", "unknown")
+                            with store_lock:
+                                store[key][domain].append(obj)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+    print(f"[API] Loaded existing data from: {', '.join(str(d) for d in loaded_dirs) or DATA_DIR}")
 
 # ── File watcher ──────────────────────────────────────────────────────────────
 
@@ -151,43 +289,65 @@ file_positions = {}
 
 def watch_files():
     while True:
-        for fname, key in FILE_TO_KEY.items():
-            path = DATA_DIR / fname
-            if not path.exists():
-                continue
-            pos = file_positions.get(fname, 0)
-            try:
-                with open(path) as f:
-                    f.seek(pos)
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            obj    = json.loads(line)
-                            domain = obj.get("domain", "unknown")
-                            with store_lock:
-                                store[key][domain].append(obj)
-                            with live_feed_lock:
-                                live_feed.append(obj)
-                                if len(live_feed) > MAX_LIVE:
-                                    live_feed.pop(0)
-                        except Exception:
-                            pass
-                    file_positions[fname] = f.tell()
-            except Exception:
-                pass
+        for data_dir in existing_data_dirs():
+            for fname, key in FILE_TO_KEY.items():
+                path = data_dir / fname
+                if not path.exists():
+                    continue
+                pos_key = str(path)
+                pos = file_positions.get(pos_key, 0)
+                try:
+                    with open(path, "rb") as f:
+                        f.seek(pos)
+                        for line_bytes in f:
+                            line = line_bytes.decode("utf-8", errors="replace").strip()
+                            if not line:
+                                continue
+                            try:
+                                obj = json.loads(line)
+                                remember_event(obj, key)
+                            except Exception:
+                                pass
+                        file_positions[pos_key] = f.tell()
+                except Exception:
+                    pass
         time.sleep(0.5)
 
 # ── Send command to C host ────────────────────────────────────────────────────
 
 def send_to_c(command_dict):
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(C_SOCKET)
         cmd  = command_dict.get("command", "")
         args = command_dict.get("args", "")
         line = f"{cmd} {args}\n" if args else f"{cmd}\n"
+
+        if IS_WINDOWS:
+            try:
+                import win32file
+            except ImportError:
+                return "ERROR: pywin32 not installed. Run: pip install pywin32"
+
+            handle = win32file.CreateFile(
+                C_SOCKET,
+                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                0,
+                None,
+                win32file.OPEN_EXISTING,
+                0,
+                None,
+            )
+            try:
+                win32file.WriteFile(handle, line.encode("utf-8"))
+                try:
+                    _, data = win32file.ReadFile(handle, 4096)
+                    return data.decode("utf-8", errors="replace")
+                except Exception:
+                    return ""
+            finally:
+                win32file.CloseHandle(handle)
+
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(C_SOCKET)
         sock.sendall(line.encode())
         sock.settimeout(3)
         try:    resp = sock.recv(4096).decode(errors="replace")
@@ -202,7 +362,7 @@ def send_to_c(command_dict):
 def rust_find(selector, domain=None, limit=100):
     if not RUST_BIN.exists():
         return {"error": "rust_finder not built. Run: cd rust_finder && cargo build --release"}
-    html_files = list(DATA_DIR.glob("html_*.json"))
+    html_files = [f for data_dir in existing_data_dirs() for f in data_dir.glob("html_*.json")]
     if domain:
         filtered = []
         for hf in html_files:
@@ -495,24 +655,30 @@ def export_zip(domain=None):
                         zf.writestr(f"{domain}/{key}.json",
                                     json.dumps(items, indent=2))
             # HTML files for this domain
-            for hf in DATA_DIR.glob("html_*.json"):
-                try:
-                    obj = json.loads(hf.read_text())
-                    if domain in obj.get("data", {}).get("url", ""):
-                        zf.write(str(hf), f"{domain}/{hf.name}")
-                except Exception:
-                    pass
+            for data_dir in existing_data_dirs():
+                for hf in data_dir.glob("html_*.json"):
+                    try:
+                        obj = json.loads(hf.read_text(encoding="utf-8"))
+                        if domain in obj.get("data", {}).get("url", ""):
+                            zf.write(str(hf), f"{domain}/{hf.name}")
+                    except Exception:
+                        pass
         else:
             # Export everything
-            for fname in DATA_DIR.glob("*.jsonl"):
-                zf.write(str(fname), fname.name)
-            # Include WS-specific files
-            for fname in DATA_DIR.glob("ws_*.jsonl"):
-                zf.write(str(fname), fname.name)
-            for fname in DATA_DIR.glob("html_*.json"):
-                zf.write(str(fname), fname.name)
-            for fname in DATA_DIR.glob("screenshot_*.json"):
-                zf.write(str(fname), fname.name)
+            added = set()
+            for data_dir in existing_data_dirs():
+                for pattern in ("*.jsonl", "html_*.json", "screenshot_*.json"):
+                    for fname in data_dir.glob(pattern):
+                        arcname = fname.name
+                        if arcname in added:
+                            parent = data_dir.name or "data"
+                            arcname = f"{parent}/{fname.name}"
+                            suffix = 2
+                            while arcname in added:
+                                arcname = f"{parent}_{suffix}/{fname.name}"
+                                suffix += 1
+                        zf.write(str(fname), arcname)
+                        added.add(arcname)
     buf.seek(0)
     return buf.read()
 
@@ -1148,9 +1314,35 @@ class ScraperAPI(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path   = parsed.path.rstrip("/")
         length = int(self.headers.get("Content-Length", 0))
-        body   = json.loads(self.rfile.read(length)) if length > 0 else {}
+        try:
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+        except json.JSONDecodeError:
+            self.send_json({"error": "invalid JSON body"}, 400)
+            return
 
-        if path == "/queue/add":
+        if path == "/api/v1/ingest":
+            if not isinstance(body, dict):
+                self.send_json({"error": "expected JSON object"}, 400); return
+            event_type = body.get("type")
+            if not event_type:
+                self.send_json({"error": "missing event type"}, 400); return
+            body.setdefault("timestamp", int(time.time() * 1000))
+            key = EVENT_TYPE_TO_KEY.get(event_type)
+            saved_path = persist_ingested_event(body)
+            accepted = False
+            if key:
+                accepted = remember_event(body, key)
+            elif event_type in ("html", "screenshot"):
+                accepted = True
+                with live_feed_lock:
+                    live_feed.append(body)
+                    if len(live_feed) > MAX_LIVE:
+                        live_feed.pop(0)
+            else:
+                accepted = remember_event(body, "events")
+            self.send_json({"ok": True, "accepted": accepted, "saved": str(saved_path) if saved_path else None})
+
+        elif path == "/queue/add":
             urls   = body.get("urls", [])
             delay  = body.get("delay", 6)
             warmup = body.get("warmup", True)
@@ -1297,8 +1489,9 @@ if __name__ == "__main__":
     load_existing()
     threading.Thread(target=watch_files, daemon=True).start()
     print("[API] File watcher started")
+    ThreadedHTTPServer.allow_reuse_address = True
     server = ThreadedHTTPServer(("0.0.0.0", API_PORT), ScraperAPI)
-    print(f"[API] Dashboard → http://localhost:{API_PORT}")
+    print(f"[API] Dashboard -> http://localhost:{API_PORT}")
     print(f"[API] Endpoints: /tokens /auth /endpoints /intel /dommaps /find /export /live")
     print(f"[API] WebSocket endpoints: /websockets /ws/frames /ws/connections /ws/stats /ws/interesting")
     try:

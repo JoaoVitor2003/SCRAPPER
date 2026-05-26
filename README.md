@@ -17,6 +17,7 @@
 - [What SCRAPPER Captures](#-what-scrapper-captures)
 - [Advantages & Disadvantages](#-advantages--disadvantages)
 - [Universal Data API](#-universal-data-api)
+- [Codex Agent Setup](#codex-agent-setup)
 - [Quick Start — Linux / macOS](#-quick-start--linux--macos)
 - [Quick Start — Windows](#-quick-start--windows)
 - [Browser Extensions](#-browser-extensions)
@@ -91,7 +92,7 @@ YOUR SCRIPT ──── GET /api/v1/session/all ────► SCRAPPER API (l
 
 ## 🎬 See It In Action
 
-### The Dashboard — 258 captured claude.ai requests
+### The Dashboard — captured requests ready for automation
 ![SCRAPPER Dashboard Responses](./showcase.png)
 
 ### The Extension Popup — Live feed, quick capture, real-time stats
@@ -103,10 +104,9 @@ YOUR SCRIPT ──── GET /api/v1/session/all ────► SCRAPPER API (l
 ### Register Extension ID — One command after loading extension
 ![Register Extension](./register_extension_id_.png)
 
-### Real World Example — Talking to Claude.ai from the terminal via SCRAPPER
-![Claude Chat via SCRAPPER](./claudetest.png)
+### Real World Example — Using captured sessions with Codex
 
-> The script above used SCRAPPER to capture a real claude.ai session, then sent messages directly via the API — zero login code, zero Puppeteer, zero browser automation.
+> Capture a real authenticated browser session with SCRAPPER, then give Codex the exported cookies, headers, endpoint URLs, and sample payloads it needs to build or debug your automation — zero login code, zero Puppeteer, zero browser automation.
 
 ---
 
@@ -181,6 +181,20 @@ Once captured, SCRAPPER serves everything via a simple REST API at `http://local
 | `GET /api/v1/dom/snapshot?url=example.com` | DOM snapshot |
 | `GET /api/v1/export/env` | Environment variables format |
 | `GET /api/v1/bulk/all?format=[json\|jsonl\|har\|csv\|txt]` | Everything, your format |
+
+---
+
+## Codex Agent Setup
+
+Codex uses the root `AGENTS.md` file for project-specific instructions. Use that file when working on this repository with Codex.
+
+The Codex workflow is:
+
+1. Run SCRAPPER locally and capture a real browser session.
+2. Export session and request data from `http://localhost:8080`.
+3. Ask Codex to inspect the local JSON files and build the scraper or automation script.
+
+The Codex setup is local: the browser session stays on your machine, and Codex works from the repository files plus any exported JSON you choose to create.
 
 ---
 
@@ -294,6 +308,18 @@ Same as Brave/Chrome — Edge is Chromium-based, use the `extension/brave/` fold
 ---
 
 ## 🔧 Using Captured Data in Your Tools
+
+### Codex Workflow
+
+Use SCRAPPER to capture the real browser traffic first, then point Codex at the exported request data while you build the scraper or automation script.
+
+```bash
+# Export the latest captured session and request history
+curl -s "http://localhost:8080/api/v1/session/all" > session.json
+curl -s "http://localhost:8080/api/v1/requests/recent?limit=100" > recent_requests.json
+```
+
+Then ask Codex to inspect the local JSON files and generate the code that replays the authenticated request flow. Keep raw cookies and bearer tokens local unless you intentionally want to share them with a remote tool.
 
 ### Python + curl_cffi (Recommended)
 

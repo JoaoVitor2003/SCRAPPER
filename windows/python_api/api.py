@@ -32,11 +32,18 @@ IS_WINDOWS = sys.platform == "win32"
 # ── Config with platform-specific paths ───────────────────────────────────────
 
 # Base path handling
+SCRIPT_PATH = Path(__file__).resolve()
 if IS_WINDOWS:
-    # On Windows, use %USERPROFILE%/scraper
-    BASE = Path(os.environ.get("USERPROFILE", "C:/")) / "scraper"
+    checkout_root = SCRIPT_PATH.parents[2] if len(SCRIPT_PATH.parents) > 2 else SCRIPT_PATH.parent
+    install_root = SCRIPT_PATH.parents[1] if len(SCRIPT_PATH.parents) > 1 else SCRIPT_PATH.parent
+    if (checkout_root / "c_core" / "native_host").exists():
+        BASE = checkout_root
+    else:
+        BASE = install_root
     C_SOCKET = r"\\.\pipe\scraper"  # Windows named pipe
-    RUST_BIN = BASE / "rust_finder" / "target" / "x86_64-pc-windows-gnu" / "release" / "rust_finder.exe"
+    RUST_BIN = BASE / "rust_finder" / "rust_finder.exe"
+    if not RUST_BIN.exists():
+        RUST_BIN = BASE / "rust_finder" / "target" / "x86_64-pc-windows-gnu" / "release" / "rust_finder.exe"
 else:
     BASE = Path("/home/PeaseErnest/scraper")
     C_SOCKET = "/tmp/scraper.sock"
@@ -49,6 +56,23 @@ API_PORT     = 8080
 # Create directories (works on both platforms)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+# The Windows native host writes captures relative to debug_host.exe. When the
+# project is run directly from a checkout, that is not the same directory the
+# API historically used. Watch both so the dashboard sees live extension data.
+REPO_ROOT = BASE
+DATA_DIRS = []
+for candidate in (
+    DATA_DIR,
+    REPO_ROOT / "c_core" / "native_host" / "data",
+    REPO_ROOT / "windows" / "c_core" / "native_host" / "data",
+    Path(os.environ.get("USERPROFILE", "C:/")) / ".scrapper" / "bin" / "data",
+):
+    if candidate not in DATA_DIRS:
+        DATA_DIRS.append(candidate)
+
+def existing_data_dirs():
+    return [d for d in DATA_DIRS if d.exists()]
 
 # ── In-memory store ───────────────────────────────────────────────────────────
 
@@ -133,43 +157,124 @@ FILE_TO_KEY = {
     "fingerprints.jsonl":"fingerprints",
 }
 
+EVENT_TYPE_TO_KEY = {
+    "request":          "requests",
+    "response":         "responses",
+    "response_body":    "bodies",
+    "auth_cookie":      "auth",
+    "cookies":          "cookies",
+    "cookies_changed":  "cookies",
+    "websocket":        "websockets",
+    "dommap":           "dommaps",
+    "storage":          "storage",
+    "fingerprint":      "fingerprints",
+}
+
+TYPE_TO_FILE = {
+    "request":          "requests.jsonl",
+    "response":         "responses.jsonl",
+    "response_body":    "bodies.jsonl",
+    "auth_cookie":      "auth.jsonl",
+    "cookies":          "cookies.jsonl",
+    "cookies_changed":  "cookies.jsonl",
+    "websocket":        "websockets.jsonl",
+    "dommap":           "dommaps.jsonl",
+    "storage":          "storage.jsonl",
+    "fingerprint":      "fingerprints.jsonl",
+}
+
+seen_events = set()
+
+def event_marker(key, obj):
+    return (
+        key,
+        obj.get("requestId"),
+        obj.get("timestamp"),
+        obj.get("url"),
+        obj.get("type"),
+        obj.get("name"),
+    )
+
+def remember_event(obj, key, add_to_live=True):
+    marker = event_marker(key, obj)
+    with store_lock:
+        if marker in seen_events:
+            return False
+        seen_events.add(marker)
+        domain = obj.get("domain", "unknown")
+        store[key][domain].append(obj)
+    if add_to_live:
+        with live_feed_lock:
+            live_feed.append(obj)
+            if len(live_feed) > MAX_LIVE:
+                live_feed.pop(0)
+    return True
+
+def persist_ingested_event(obj):
+    event_type = obj.get("type")
+    if event_type == "html":
+        path = DATA_DIR / f"html_{int(time.time())}.json"
+    elif event_type == "screenshot":
+        path = DATA_DIR / f"screenshot_{int(time.time())}.json"
+    else:
+        fname = TYPE_TO_FILE.get(event_type)
+        if not fname:
+            return None
+        path = DATA_DIR / fname
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    return path
+
 # ── Load existing data ────────────────────────────────────────────────────────
 
 def load_existing():
-    for fname, key in FILE_TO_KEY.items():
-        path = DATA_DIR / fname
-        if not path.exists():
-            continue
-        try:
-            if IS_WINDOWS:
-                with open(path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            obj    = json.loads(line)
-                            domain = obj.get("domain", "unknown")
-                            with store_lock:
-                                store[key][domain].append(obj)
-                        except Exception:
-                            pass
-            else:
-                with open(path) as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            obj    = json.loads(line)
-                            domain = obj.get("domain", "unknown")
-                            with store_lock:
-                                store[key][domain].append(obj)
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-    print(f"[API] Loaded existing data from {DATA_DIR}")
+    loaded_dirs = existing_data_dirs()
+    seen = set()
+    for data_dir in loaded_dirs:
+        for fname, key in FILE_TO_KEY.items():
+            path = data_dir / fname
+            if not path.exists():
+                continue
+            try:
+                if IS_WINDOWS:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                obj    = json.loads(line)
+                                marker = event_marker(key, obj)
+                                if marker in seen:
+                                    continue
+                                seen.add(marker)
+                                seen_events.add(marker)
+                                domain = obj.get("domain", "unknown")
+                                with store_lock:
+                                    store[key][domain].append(obj)
+                            except Exception:
+                                pass
+                else:
+                    with open(path) as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                obj    = json.loads(line)
+                                marker = event_marker(key, obj)
+                                if marker in seen:
+                                    continue
+                                seen.add(marker)
+                                seen_events.add(marker)
+                                domain = obj.get("domain", "unknown")
+                                with store_lock:
+                                    store[key][domain].append(obj)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+    print(f"[API] Loaded existing data from: {', '.join(str(d) for d in loaded_dirs) or DATA_DIR}")
 
 # ── Socket/pipe communication ─────────────────────────────────────────────────
 
@@ -238,7 +343,7 @@ def rust_find(selector, domain=None, limit=100):
     if not RUST_BIN.exists():
         return {"error": f"rust_finder not found at {RUST_BIN}. Build it first."}
     
-    html_files = list(DATA_DIR.glob("html_*.json"))
+    html_files = [f for data_dir in existing_data_dirs() for f in data_dir.glob("html_*.json")]
     if domain:
         filtered = []
         for hf in html_files:
@@ -438,21 +543,31 @@ def export_zip(domain=None):
                         zf.writestr(f"{domain}/{key}.json",
                                     json.dumps(items, indent=2))
             # HTML files for this domain
-            for hf in DATA_DIR.glob("html_*.json"):
-                try:
-                    obj = json.loads(hf.read_text(encoding='utf-8'))
-                    if domain in obj.get("data", {}).get("url", ""):
-                        zf.write(str(hf), f"{domain}/{hf.name}")
-                except Exception:
-                    pass
+            for data_dir in existing_data_dirs():
+                html_files = data_dir.glob("html_*.json")
+                for hf in html_files:
+                    try:
+                        obj = json.loads(hf.read_text(encoding='utf-8'))
+                        if domain in obj.get("data", {}).get("url", ""):
+                            zf.write(str(hf), f"{domain}/{hf.name}")
+                    except Exception:
+                        pass
         else:
             # Export everything
-            for fname in DATA_DIR.glob("*.jsonl"):
-                zf.write(str(fname), fname.name)
-            for fname in DATA_DIR.glob("html_*.json"):
-                zf.write(str(fname), fname.name)
-            for fname in DATA_DIR.glob("screenshot_*.json"):
-                zf.write(str(fname), fname.name)
+            added = set()
+            for data_dir in existing_data_dirs():
+                for fname in data_dir.glob("*.jsonl"):
+                    arcname = fname.name if fname.name not in added else f"{data_dir.name}/{fname.name}"
+                    zf.write(str(fname), arcname)
+                    added.add(arcname)
+                for fname in data_dir.glob("html_*.json"):
+                    arcname = fname.name if fname.name not in added else f"{data_dir.name}/{fname.name}"
+                    zf.write(str(fname), arcname)
+                    added.add(arcname)
+                for fname in data_dir.glob("screenshot_*.json"):
+                    arcname = fname.name if fname.name not in added else f"{data_dir.name}/{fname.name}"
+                    zf.write(str(fname), arcname)
+                    added.add(arcname)
     buf.seek(0)
     return buf.read()
 
@@ -741,55 +856,45 @@ file_positions = {}
 
 def watch_files():
     while True:
-        for fname, key in FILE_TO_KEY.items():
-            path = DATA_DIR / fname
-            if not path.exists():
-                continue
-            pos = file_positions.get(fname, 0)
-            try:
-                # Use appropriate mode for each platform
-                if IS_WINDOWS:
-                    # On Windows, use binary mode to handle newlines properly
-                    with open(path, 'rb') as f:
-                        f.seek(pos)
-                        for line_bytes in f:
-                            line = line_bytes.decode('utf-8', errors='replace').strip()
-                            if not line:
-                                continue
-                            try:
-                                obj = json.loads(line)
-                                domain = obj.get("domain", "unknown")
-                                with store_lock:
-                                    store[key][domain].append(obj)
-                                with live_feed_lock:
-                                    live_feed.append(obj)
-                                    if len(live_feed) > MAX_LIVE:
-                                        live_feed.pop(0)
-                            except Exception:
-                                pass
-                        file_positions[fname] = f.tell()
-                else:
-                    # Linux: text mode
-                    with open(path, 'r') as f:
-                        f.seek(pos)
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                obj = json.loads(line)
-                                domain = obj.get("domain", "unknown")
-                                with store_lock:
-                                    store[key][domain].append(obj)
-                                with live_feed_lock:
-                                    live_feed.append(obj)
-                                    if len(live_feed) > MAX_LIVE:
-                                        live_feed.pop(0)
-                            except Exception:
-                                pass
-                        file_positions[fname] = f.tell()
-            except Exception:
-                pass
+        for data_dir in existing_data_dirs():
+            for fname, key in FILE_TO_KEY.items():
+                path = data_dir / fname
+                if not path.exists():
+                    continue
+                pos_key = str(path)
+                pos = file_positions.get(pos_key, 0)
+                try:
+                    # Use appropriate mode for each platform
+                    if IS_WINDOWS:
+                        # On Windows, use binary mode to handle newlines properly
+                        with open(path, 'rb') as f:
+                            f.seek(pos)
+                            for line_bytes in f:
+                                line = line_bytes.decode('utf-8', errors='replace').strip()
+                                if not line:
+                                    continue
+                                try:
+                                    obj = json.loads(line)
+                                    remember_event(obj, key)
+                                except Exception:
+                                    pass
+                            file_positions[pos_key] = f.tell()
+                    else:
+                        # Linux: text mode
+                        with open(path, 'r') as f:
+                            f.seek(pos)
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    obj = json.loads(line)
+                                    remember_event(obj, key)
+                                except Exception:
+                                    pass
+                            file_positions[pos_key] = f.tell()
+                except Exception:
+                    pass
         time.sleep(0.5)
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -1127,7 +1232,27 @@ class ScraperAPI(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body   = json.loads(self.rfile.read(length)) if length > 0 else {}
 
-        if path == "/queue/add":
+        if path == "/api/v1/ingest":
+            if not isinstance(body, dict):
+                self.send_json({"error": "expected JSON object"}, 400); return
+            event_type = body.get("type")
+            if not event_type:
+                self.send_json({"error": "missing event type"}, 400); return
+            body.setdefault("timestamp", int(time.time() * 1000))
+            key = EVENT_TYPE_TO_KEY.get(event_type)
+            saved_path = persist_ingested_event(body)
+            accepted = False
+            if key:
+                accepted = remember_event(body, key)
+            elif event_type in ("html", "screenshot"):
+                accepted = True
+                with live_feed_lock:
+                    live_feed.append(body)
+                    if len(live_feed) > MAX_LIVE:
+                        live_feed.pop(0)
+            self.send_json({"ok": True, "accepted": accepted, "saved": str(saved_path) if saved_path else None})
+
+        elif path == "/queue/add":
             urls   = body.get("urls", [])
             delay  = body.get("delay", 6)
             warmup = body.get("warmup", True)

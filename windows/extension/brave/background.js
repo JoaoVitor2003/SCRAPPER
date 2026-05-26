@@ -1,5 +1,6 @@
 // background.js - SESSION ISOLATED SCRAPER v3.2 (FIXED)
 const BROWSER = 'brave';
+const API_BASE = 'http://localhost:8080';
 let nativePort = null;
 let reconnectAttempts = 0;
 let keepAliveInterval = null;
@@ -42,6 +43,19 @@ function send(obj) {
   if (nativePort) {
     try { nativePort.postMessage(obj); }
     catch(e) { console.error('send failed', e); }
+  }
+  sendToAPI(obj);
+}
+
+async function sendToAPI(obj) {
+  try {
+    await fetch(`${API_BASE}/api/v1/ingest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(obj)
+    });
+  } catch(e) {
+    // API may be stopped while the extension is still tracking.
   }
 }
 

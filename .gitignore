@@ -1,2 +1,6 @@
 data
 logs
+session.json
+recent_requests.json
+*_session.json
+*_requests.json
